@@ -1,0 +1,61 @@
+# R and RStudio
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+renv/library/
+renv/staging/
+
+# Installed runtimes and package libraries
+R/runtime/
+R/library/
+library/
+runtime/
+
+# Build and packaging outputs
+build/
+dist/
+staging/
+release/
+post_archive_validation*/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.7z
+*.sha256
+
+# Scientific data and exports
+*.fasta
+*.fa
+*.faa
+*.parquet
+*.xlsx
+*.xls
+*.csv
+
+# Logs, caches, and temporary files
+*.log
+*.tmp
+*.temp
+cache/
+logs/
+__pycache__/
+.DS_Store
+Thumbs.db
+
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Private governance and local evidence
+10_governance_private/
+evidence/
+validation_private/
