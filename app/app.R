@@ -45,6 +45,11 @@ RULE_DEFINITIONS <- data.frame(
   stringsAsFactors = FALSE
 )
 
+#' Create an empty, typed protein-record table
+#'
+#' @return A zero-row data frame with the same columns as `read_fasta()`.
+#' @details Used to represent an absent reference proteome while preserving
+#'   column types required by downstream candidate evaluation.
 empty_proteome <- function() {
   data.frame(
     id = character(), original_id = character(), accession = character(),
@@ -54,6 +59,13 @@ empty_proteome <- function() {
   )
 }
 
+#' Create a filename-safe accession label
+#'
+#' @param protein_id FASTA identifier or text label; the first element is used.
+#' @return A sanitized character label, or `unknown_protein` when unavailable.
+#' @details For UniProt-style IDs (`sp|accession|entry` or `tr|...`), the
+#'   accession is extracted. Other labels are sanitized directly. This is an
+#'   export-filename helper and does not establish protein identity.
 extract_accession <- function(protein_id) {
   if (is.null(protein_id) || length(protein_id) == 0 || !nzchar(protein_id[1])) {
     return("unknown_protein")
@@ -69,6 +81,13 @@ extract_accession <- function(protein_id) {
   ifelse(nzchar(accession), accession, "unknown_protein")
 }
 
+#' Parse an input protein identifier and isoform suffix
+#'
+#' @param id First token of a FASTA header.
+#' @return List with `accession`, `base_id`, and `isoform` strings.
+#' @details UniProt-style `sp|...|...` and `tr|...|...` identifiers are parsed;
+#'   a trailing `-N` suffix is interpreted as an isoform number. Non-UniProt
+#'   identifiers are kept as supplied, rather than validated against UniProt.
 parse_identifier <- function(id) {
   parts <- strsplit(id, "\\|")[[1]]
   is_uniprot <- length(parts) >= 3 && parts[1] %in% c("sp", "tr") && nzchar(parts[2])
@@ -82,6 +101,12 @@ parse_identifier <- function(id) {
   list(accession = accession, base_id = base_id, isoform = isoform)
 }
 
+#' Construct a timestamped Excel filename
+#'
+#' @param target_label Identifier or label for the selected target(s).
+#' @return Filename ending in `_peptide_selection_YYYYmmdd_HHMMSS.xlsx`.
+#' @details Uses local system time and a sanitized target label; the timestamp
+#'   is output metadata and is not part of the scientific scoring algorithm.
 make_export_filename <- function(target_label) {
   paste0(
     extract_accession(target_label),
@@ -91,6 +116,28 @@ make_export_filename <- function(target_label) {
   )
 }
 
+#' Read and normalize a protein FASTA file
+#'
+#' Parses a reference proteome or target-protein FASTA/FAA file into a
+#' tabular representation. Headers, accessions, optional gene names, protein
+#' sequences, and lengths are retained to support peptide-level traceability.
+#'
+#' @param path Path to a readable FASTA or FAA file.
+#' @param progress_callback Optional callback accepting named arguments
+#'   `completed` and `total`; invoked during parsing for progress reporting.
+#'
+#' @return A data frame with `id`, `original_id`, `accession`, `base_id`,
+#'   `isoform`, `gene`, `name`, `sequence`, and `sequence_length` columns.
+#' @details
+#' Sequence lines are concatenated, whitespace is removed, and residues
+#' are converted to uppercase. A terminal stop symbol (`*`) is stripped;
+#' internal stop symbols, empty sequences, and unsupported characters cause
+#' an error. UniProt-style identifiers are parsed when available. Duplicate
+#' original identifiers receive distinct `id` values via `make.unique()`;
+#' the original identifier is preserved separately.
+#'
+#' This routine validates syntax and supported symbols, not protein identity,
+#' proteome completeness, or the biological provenance of an input sequence.
 read_fasta <- function(
     path,
     progress_callback = NULL
@@ -308,11 +355,28 @@ read_fasta <- function(
     )
 }
 
+#' Find one-based positions of a cleavage-site pattern
+#'
+#' @param sequence Single protein or peptide string.
+#' @param pattern Perl-compatible regular expression.
+#' @return Integer vector of positions, or `integer(0)` if no match.
+#' @details Calls `gregexpr()`; its positions refer to the start of each
+#'   matched pattern and should not be confused with cut coordinates.
 find_regex_positions <- function(sequence, pattern) {
   hits <- gregexpr(pattern, sequence, perl = TRUE)[[1]]
   if (length(hits) == 1 && hits[1] == -1) integer(0) else as.integer(hits)
 }
 
+#' Locate internal enzyme-specific cleavage boundaries
+#'
+#' @param sequence Protein amino-acid sequence.
+#' @param enzyme One of the nine supported enzyme configuration names.
+#' @return Sorted unique integer cut positions strictly between 0 and sequence
+#'   length; a position denotes cleavage after that residue.
+#' @details Trypsin excludes K/R followed by P; Trypsin/P does not. AspN cuts
+#'   before D and is represented by the preceding residue position. Other
+#'   enzyme definitions are implemented as explicit motif rules in this
+#'   function, not as empirically calibrated digestion efficiencies.
 cleavage_positions <- function(sequence, enzyme) {
   n <- nchar(sequence)
 
@@ -345,6 +409,25 @@ cleavage_positions <- function(sequence, enzyme) {
   sort(unique(cuts[cuts > 0L & cuts < n]))
 }
 
+#' Generate in silico digestion fragments, including missed cleavages
+#'
+#' Enumerates contiguous enzyme-defined digestion fragments and adjacent
+#' fragment combinations up to the requested missed-cleavage count.
+#'
+#' @param sequence Single amino-acid sequence as a character string.
+#' @param enzyme Name of a supported enzyme configuration (see `ENZYMES`).
+#' @param missed_cleavages Maximum missed cleavages: integer 0, 1, or 2.
+#'
+#' @return Data frame with `peptide`, `start`, `end`, `length`, and
+#'   `missed_cleavages` columns; coordinates are 1-based and inclusive.
+#' @details
+#' Cleavage positions come from `cleavage_positions()`. Each missed-cleavage
+#' event joins two neighboring enzyme-generated fragments; two events join
+#' three. This function does NOT apply candidate length filtering. The
+#' downstream `make_target_candidates()` function limits candidate instances
+#' to lengths 4 through 25 amino acids before rule evaluation.
+#'
+#' Enzyme-specific definitions are documented in `docs/ALGORITHM.md`.
 digest_protein <- function(
     sequence,
     enzyme,
@@ -401,6 +484,14 @@ digest_protein <- function(
   bind_rows(rows)
 }
 
+#' Check if a peptide contains an internal enzyme cleavage site
+#'
+#' @param pep Candidate peptide string.
+#' @param enzyme Digestion configuration name.
+#' @return Logical scalar indicating an internal potential cleavage site.
+#' @details This is a motif-based helper and is not called by the main
+#'   `evaluate_peptide()` scoring path in v0.2.5. Missed-cleavage penalties in
+#'   the main path use the enumerated fragment-combination count instead.
 has_internal_cleavage_site <- function(pep, enzyme) {
   n <- nchar(pep)
   if (n <= 1L) return(FALSE)
@@ -444,11 +535,39 @@ has_internal_cleavage_site <- function(pep, enzyme) {
   any(find_regex_positions(pep, pattern) < n)
 }
 
+#' Count literal peptide occurrences in one protein sequence
+#'
+#' @param pattern Peptide substring to search for without regex interpretation.
+#' @param sequence Protein sequence string.
+#' @return Integer count of positions found by fixed-string `gregexpr()`.
+#' @details The count is distinct from the number of reference protein entries
+#'   containing the peptide.
 count_fixed_occurrences <- function(pattern, sequence) {
   hits <- gregexpr(pattern, sequence, fixed = TRUE)[[1]]
   if (length(hits) == 1 && hits[1] == -1) 0L else length(hits)
 }
 
+#' Locate exact peptide subsequences in the reference proteome
+#'
+#' Searches all reference protein sequences for the exact peptide character
+#' string and summarizes matching entries and total occurrences.
+#'
+#' @param peptide Candidate peptide sequence as a character string.
+#' @param reference_proteome Data frame returned by `read_fasta()`, containing
+#'   reference protein IDs, sequences, normalized accessions, and genes.
+#' @param match_cache Optional environment used to cache results by peptide
+#'   sequence; cached entries are returned without rescanning the proteome.
+#'
+#' @return Named list containing `entry_count`, `occurrence_count`, `ids`,
+#'   `genes`, and `bases`. The last three fields identify the reference
+#'   entries, distinct nonempty gene annotations, and normalized accession
+#'   groups involved in matches.
+#' @details
+#' Matching uses exact contiguous sequence-substring occurrence, not
+#' digestion-specific matching or a statistical peptide-detectability model.
+#' A match can therefore occur outside the cleavage boundaries of the enzyme
+#' selected elsewhere in the workflow. Interpretation of allowed/disallowed
+#' matches is handled separately by `evaluate_peptide()`.
 find_reference_matches <- function(peptide, reference_proteome, match_cache = NULL) {
   if (!is.null(match_cache) && exists(peptide, envir = match_cache, inherits = FALSE)) {
     return(get(peptide, envir = match_cache, inherits = FALSE))
@@ -492,6 +611,12 @@ find_reference_matches <- function(peptide, reference_proteome, match_cache = NU
   result
 }
 
+#' Check a specific internal, proline-sensitive tryptic boundary
+#'
+#' @param sequence Full target protein sequence.
+#' @param cut_after One-based coordinate of the residue before the cut.
+#' @return `TRUE` only for internal K/R sites not followed by P.
+#' @details Does not treat sequence termini as internal cleavage boundaries.
 valid_tryptic_cut <- function(sequence, cut_after) {
   n <- nchar(sequence)
   if (length(cut_after) != 1L || is.na(cut_after) || cut_after < 1L || cut_after >= n) {
@@ -502,6 +627,14 @@ valid_tryptic_cut <- function(sequence, cut_after) {
   p1 %in% c("K", "R") && p1_prime != "P"
 }
 
+#' Evaluate acidic residues surrounding a valid tryptic cut
+#'
+#' @param sequence Full target protein sequence.
+#' @param cut_after One-based cleavage coordinate.
+#' @return List with `valid_site`, `risk`, affected `positions`, and `residues`.
+#' @details Evaluates available P3, P2, P1-prime, P2-prime, and P3-prime
+#'   positions. The cleavage residue at P1 is not inspected for D/E; windows
+#'   are truncated at protein boundaries.
 acidic_window_at_cut <- function(sequence, cut_after) {
   if (!valid_tryptic_cut(sequence, cut_after)) {
     return(list(valid_site = FALSE, risk = FALSE, positions = integer(), residues = character()))
@@ -519,6 +652,16 @@ acidic_window_at_cut <- function(sequence, cut_after) {
   )
 }
 
+#' Assess D/E proximity at peptide-delimiting tryptic boundaries
+#'
+#' @param target_sequence Full target protein sequence.
+#' @param start,end One-based inclusive peptide coordinates.
+#' @param enzyme Digestion configuration.
+#' @return Applicability, pass result, number of valid assessed sites, and
+#'   lists of affected N/C boundaries, positions, and residues.
+#' @details Applicable only to `Trypsin`; checks internal boundaries that
+#'   delimit the candidate. If there are no valid sites, the result is
+#'   applicable with zero assessed sites and no detected acidic risk.
 assess_acidic_near_tryptic_cleavage <- function(target_sequence, start, end, enzyme) {
   if (!identical(enzyme, "Trypsin")) {
     return(list(
@@ -553,6 +696,15 @@ assess_acidic_near_tryptic_cleavage <- function(target_sequence, start, end, enz
   )
 }
 
+#' Evaluate proline following a Trypsin/P K/R cleavage boundary
+#'
+#' @param target_sequence Full target sequence.
+#' @param start One-based candidate starting coordinate.
+#' @param enzyme Selected enzyme.
+#' @return List with `applicable`, `pass`, and P1/P1-prime residues.
+#' @details Applicable only when the peptide begins internally after K/R
+#'   under `Trypsin/P`. It is not applicable at the protein N-terminus or
+#'   under enzymes other than Trypsin/P.
 assess_proline_p1prime <- function(
     target_sequence,
     start,
@@ -589,6 +741,13 @@ assess_proline_p1prime <- function(
   )
 }
 
+#' Find reference entries identical to a complete target sequence
+#'
+#' @param target_sequence Full target protein sequence.
+#' @param reference_proteome Parsed reference table.
+#' @return Character vector of IDs whose entire sequence equals the target.
+#' @details Used only for policies permitting complete sequence-identical
+#'   reference entries; this is not a peptide-level similarity calculation.
 exact_reference_ids <- function(target_sequence, reference_proteome) {
   if (is.null(reference_proteome) || nrow(reference_proteome) == 0) {
     return(character())
@@ -596,6 +755,40 @@ exact_reference_ids <- function(target_sequence, reference_proteome) {
   reference_proteome$id[reference_proteome$sequence == target_sequence]
 }
 
+#' Apply the twelve selection rules to one candidate peptide
+#'
+#' Evaluates each rule, its applicability, and the user-selected policy
+#' (`ignore`, `apply`, or `block`) without short-circuiting on exclusions.
+#'
+#' @param pep Candidate peptide sequence.
+#' @param rules Named list with one configured policy per rule in `RULE_NAMES`.
+#' @param reference_proteome Parsed reference proteome.
+#' @param target_id Unique target entry identifier.
+#' @param target_source Target source category (reference or external FASTA).
+#' @param target_sequence Full sequence of the selected target protein.
+#' @param enzyme Selected digestion configuration.
+#' @param start,end Candidate's 1-based inclusive positions in the target.
+#' @param target_sequence_length Length of the full target protein.
+#' @param missed_cleavages Observed count for this candidate (0, 1, or 2).
+#' @param reference_policy Reference-match interpretation for external targets.
+#' @param match_cache Optional peptide-match cache environment.
+#' @param precomputed_allowed_ids Optional reference IDs permitted for this
+#'   target, avoiding redundant whole-sequence matching.
+#'
+#' @return Named list including `valid`, `status`, `score`, per-rule `trace`,
+#'   `pass` and `applicable`, `blocked_by`, a heuristic charge value, and
+#'   additional context explaining reference matching and cleavage checks.
+#' @details
+#' Each candidate starts with a score of `length(RULE_NAMES)` (12 in v0.2.5).
+#' A failed applicable rule configured as `apply` usually contributes -1;
+#' the missed-cleavage rule contributes minus the observed number of missed
+#' cleavages. `ignore` and `block` do not directly subtract from the score.
+#' A failed `block` rule changes eligibility to `blocked`, independently of
+#' the numeric score. Inapplicable rules contribute no penalty. All twelve
+#' rule outcomes remain available for audit.
+#'
+#' This is a configurable sequence-based prioritization heuristic; it is NOT
+#' a validated probability of experimental peptide detectability.
 evaluate_peptide <- function(
     pep,
     rules,
@@ -721,6 +914,12 @@ evaluate_peptide <- function(
   )
 }
 
+#' Read the twelve rule policies from Shiny inputs
+#'
+#' @param input Shiny input object containing one `rule_<name>` per rule.
+#' @return Named list of policies in `RULE_NAMES` order.
+#' @details This function translates UI state to a rule configuration; it
+#'   does not independently validate policy values.
 build_rules <- function(input) {
   setNames(
     lapply(RULE_NAMES, function(r) input[[paste0("rule_", r)]]),
@@ -728,6 +927,36 @@ build_rules <- function(input) {
   )
 }
 
+#' Generate and evaluate all peptide candidate instances for targets
+#'
+#' Applies in silico digestion and candidate-length filtering to each
+#' selected target, evaluates every resulting peptide against the reference
+#' proteome, and constructs candidate- and rule-level output tables.
+#'
+#' @param targets Data frame of target proteins produced by `read_fasta()`.
+#' @param source_label Target source category used in specificity checks.
+#' @param enzyme Digestion enzyme configuration.
+#' @param rules Named, validated rule configuration.
+#' @param reference_proteome Parsed reference protein sequences.
+#' @param reference_policy Reference-specificity policy.
+#' @param missed_cleavages Maximum allowed missed cleavages (0, 1, or 2).
+#' @param match_cache Optional environment for peptide-match reuse.
+#'
+#' @return Named list with `candidates`, `rule_trace`, and `target_summary`
+#'   data frames. `candidates` contains one row per peptide candidate instance;
+#'   `rule_trace` contains one row per candidate x rule; `target_summary`
+#'   records raw and evaluated candidate counts per target protein.
+#' @details
+#' Digestion first yields all enzyme-defined fragment combinations allowed
+#' by the missed-cleavage setting. Instances are then restricted to peptide
+#' lengths 4 through 25 before the twelve configurable rules are evaluated.
+#' A candidate instance is associated with its target, coordinates, enzyme,
+#' number of missed cleavages, score, eligibility, and reference-match context.
+#' Identical peptide sequences occurring at different coordinates or in
+#' different targets remain distinguishable candidate instances.
+#'
+#' For every evaluated instance, all twelve rule rows are retained, including
+#' pass/fail/not-applicable results, score effects, and blocking indicators.
 make_target_candidates <- function(
     targets,
     source_label,
@@ -900,6 +1129,12 @@ make_target_candidates <- function(
 # VALIDATION AND SHARED EXPORT HELPERS
 ##############################
 
+#' Provide the default policy for every rule
+#'
+#' @return Named list of twelve policies (`block` or `apply`).
+#' @details `unique_proteome` and `length` default to `block`; all remaining
+#'   rules default to `apply`. Defaults are algorithm configuration, and
+#'   changes would require scientific regression review.
 default_rules <- function() {
   setNames(
     as.list(c(
@@ -920,6 +1155,12 @@ default_rules <- function() {
   )
 }
 
+#' Validate the names and states of the twelve selection rules
+#'
+#' @param rules Named list containing all and only `RULE_NAMES`.
+#' @return Invisible `TRUE`; otherwise raises an informative error.
+#' @details Accepts policy values from `RULE_CHOICES` (`ignore`, `apply`,
+#'   `block`). It is a configuration-contract check, not biological validation.
 validate_rule_configuration <- function(rules) {
   if (!is.list(rules)) {
     stop("rules must be a named list.", call. = FALSE)
@@ -960,6 +1201,10 @@ validate_rule_configuration <- function(rules) {
   invisible(TRUE)
 }
 
+#' Construct a zero-row candidate table with stable column types
+#'
+#' @return Typed data frame matching the candidate export schema.
+#' @details Keeps workbook fields present even when no candidate is available.
 empty_candidate_table <- function() {
   data.frame(
     candidate_key = character(),
@@ -993,6 +1238,10 @@ empty_candidate_table <- function() {
   )
 }
 
+#' Construct a zero-row rule-trace table
+#'
+#' @return Typed data frame with all rule-level audit columns.
+#' @details Supports a consistent export schema for runs with zero candidates.
 empty_rule_trace_table <- function() {
   data.frame(
     candidate_key = character(),
@@ -1013,6 +1262,18 @@ empty_rule_trace_table <- function() {
   )
 }
 
+#' Assemble the seven logical Excel report tables
+#'
+#' @param result Output of `make_target_candidates()`.
+#' @param context Run settings, filenames, time, and rule configuration.
+#' @param reference_proteome Parsed reference protein table.
+#' @return Named list of seven data frames: `Run_summary`,
+#'   `Rule_configuration`, `Target_proteins`, `Ranked_peptides`,
+#'   `Rule_trace`, `Blocked_peptides`, and `Rule_definitions`.
+#' @details Retained candidates are ordered by descending score and stable
+#'   tie-breakers; blocked candidates remain in a separate table. Run metadata
+#'   records filenames and R version but not FASTA content hashes in v0.2.5.
+#'   This function assembles tables; Excel-specific adaptations occur later.
 build_seeknsee_workbook <- function(result, context, reference_proteome) {
   candidates <- result$candidates
   if (is.null(candidates) || ncol(candidates) == 0) {
@@ -1100,6 +1361,16 @@ EXCEL_LIST_COLUMNS <- c(
   "exact_reference_match_ids"
 )
 
+#' Shorten semicolon-delimited identifier lists for Excel cell limits
+#'
+#' @param value Character value containing delimited reference identifiers.
+#' @param safe_limit Maximum desired characters for the exported cell.
+#' @param separator Literal list separator (default semicolon).
+#' @return List with adapted `value`, total/exported/omitted ID counts,
+#'   and a `truncated` flag.
+#' @details On truncation, retains whole IDs that fit and appends an explicit
+#'   omission count. The shortened cell is not a lossless representation of
+#'   the full original identifier list.
 truncate_delimited_identifier_list <- function(
     value,
     safe_limit = EXCEL_SAFE_CELL_CHARACTERS,
@@ -1180,6 +1451,15 @@ truncate_delimited_identifier_list <- function(
   )
 }
 
+#' Adapt long identifier-list columns in one workbook sheet
+#'
+#' @param sheet Data frame representing a workbook sheet.
+#' @param sheet_name Sheet label used in the audit records.
+#' @param safe_limit Per-cell threshold for identifier-list adaptation.
+#' @return List containing adapted `sheet` and truncation `audit` table.
+#' @details Only columns named in `EXCEL_LIST_COLUMNS` are adapted; audit
+#'   columns are appended for affected lists. The scientific evaluation is
+#'   already complete and is not recalculated here.
 adapt_sheet_identifier_lists_for_excel <- function(
     sheet,
     sheet_name,
@@ -1269,6 +1549,18 @@ adapt_sheet_identifier_lists_for_excel <- function(
   list(sheet = sheet, audit = audit)
 }
 
+#' Prepare workbook tables for Excel character-cell limits
+#'
+#' @param workbook Named list of tabular workbook sheets.
+#' @param safe_limit Target character limit for identifier-list fields.
+#' @return List with adapted `workbook`, `audit`, `truncation_used`,
+#'   `abbreviated_cells`, and `omitted_identifier_occurrences`.
+#' @details Adds a summary of identifier-list abbreviations when needed,
+#'   then checks the 32,767-character Excel cell limit. The `audit` object
+#'   is returned to the caller and is not an additional workbook sheet.
+#'   This implementation does not explicitly validate Excel's maximum rows
+#'   per worksheet and does not supply a lossless recovery file for IDs
+#'   abbreviated within exported cells.
 adapt_workbook_for_excel <- function(
     workbook,
     safe_limit = EXCEL_SAFE_CELL_CHARACTERS
@@ -1364,6 +1656,9 @@ adapt_workbook_for_excel <- function(
   )
 }
 
+#' Construct a zero-row Excel preflight issue table
+#'
+#' @return Typed data frame for oversized-cell findings.
 empty_excel_preflight_issues <- function() {
   data.frame(
     sheet = character(),
@@ -1378,6 +1673,14 @@ empty_excel_preflight_issues <- function() {
   )
 }
 
+#' Detect string cells exceeding Excel's character limit
+#'
+#' @param workbook Named list of workbook data frames.
+#' @param limit Maximum permitted characters per text cell (default 32,767).
+#' @return Data frame of affected sheets, columns, rows, character counts,
+#'   and available candidate context; empty when none are found.
+#' @details Checks character columns only. It does not check worksheet row
+#'   limits, maximum column counts, or overall workbook file size.
 validate_excel_workbook <- function(
     workbook,
     limit = EXCEL_MAX_CELL_CHARACTERS
@@ -1438,6 +1741,14 @@ validate_excel_workbook <- function(
     arrange(desc(characters), sheet, column, row)
 }
 
+#' Write a workbook to an XLSX file
+#'
+#' @param workbook Named list of SeekNSee workbook tables.
+#' @param output_file Destination filesystem path for the XLSX file.
+#' @return Normalized path of the exported file, or an error.
+#' @details Creates the destination directory when needed and calls
+#'   `adapt_workbook_for_excel()` before `writexl::write_xlsx()`. Some
+#'   identifier lists may be abbreviated to satisfy cell-length limits.
 export_seeknsee_workbook <- function(workbook, output_file) {
   output_directory <- dirname(output_file)
   if (!identical(output_directory, ".") && !dir.exists(output_directory)) {
@@ -1449,6 +1760,25 @@ export_seeknsee_workbook <- function(workbook, output_file) {
   normalizePath(output_file, winslash = "/", mustWork = TRUE)
 }
 
+#' Run the SeekNSee scientific workflow without a Shiny session
+#'
+#' @param reference_fasta Path to reference proteome FASTA.
+#' @param target_source `reference_proteome` or `external_fasta`.
+#' @param target_id Selected ID for a reference-proteome target.
+#' @param target_fasta External target FASTA path when applicable.
+#' @param target_scope `selected` or `all` external target records.
+#' @param selected_external_id Selected external target ID, if required.
+#' @param reference_policy `strict_absence` or `allow_exact_target_match`.
+#' @param enzyme Supported enzyme configuration.
+#' @param missed_cleavages Maximum missed-cleavage count, 0 through 2.
+#' @param rules Named rule-policy list; defaults to `default_rules()`.
+#' @param output_file Optional path for immediate XLSX export.
+#' @param reference_data Optional pre-parsed reference data frame.
+#' @param match_cache Optional cache environment shared with the caller.
+#' @return `seeknsee_validation` object containing results, context, workbook,
+#'   parsed reference data, cache, and optional exported path.
+#' @details Provides a noninteractive entry point for regression testing.
+#'   Run timestamp and elapsed time depend on the execution environment.
 run_validation_case <- function(
     reference_fasta,
     target_source = c("reference_proteome", "external_fasta"),
@@ -1573,6 +1903,13 @@ run_validation_case <- function(
   )
 }
 
+#' Summarize candidate scores, rule failures, and exclusion reasons
+#'
+#' @param validation Object returned by `run_validation_case()`.
+#' @return List of target statistics, retained-score distribution, per-rule
+#'   failure counts, top retained candidates, blocking counts, and elapsed time.
+#' @details Failure percentages are computed among applicable rule results.
+#'   This summary is descriptive; it does not establish experimental accuracy.
 summarize_validation_result <- function(validation) {
   workbook <- validation$workbook
   ranked <- workbook$Ranked_peptides
@@ -1666,6 +2003,13 @@ summarize_validation_result <- function(validation) {
   )
 }
 
+#' Check internal accounting relationships among output tables
+#'
+#' @param validation Object returned by `run_validation_case()`.
+#' @return Data frame with four identity descriptions and logical pass values.
+#' @details Checks candidate partitioning, expected rule-trace row count,
+#'   twelve rule rows per candidate, and reconstruction of scores from traces.
+#'   These invariants do not independently verify peptide chemistry.
 validate_internal_identities <- function(validation) {
   workbook <- validation$workbook
   ranked <- workbook$Ranked_peptides
@@ -1715,6 +2059,21 @@ validate_internal_identities <- function(validation) {
   )
 }
 
+#' Expose one peptide's rule-level evaluation for tests
+#'
+#' @param peptide Candidate peptide sequence.
+#' @param rules Rule policies, defaulting to `default_rules()`.
+#' @param enzyme Enzyme configuration.
+#' @param reference_proteome Parsed reference, defaulting to an empty table.
+#' @param target_id Synthetic or supplied target identifier.
+#' @param target_source Source category used by specificity policy.
+#' @param target_sequence Full target protein sequence.
+#' @param start,end One-based inclusive coordinates within target sequence.
+#' @param target_sequence_length Full target length.
+#' @param missed_cleavages Count associated with the candidate.
+#' @param reference_policy Reference specificity policy.
+#' @return Data frame with twelve rule rows and candidate score/status fields.
+#' @details Intended for controlled rule tests without running the full UI.
 evaluate_test_peptide <- function(
     peptide,
     rules = default_rules(),
@@ -1762,6 +2121,15 @@ evaluate_test_peptide <- function(
   )
 }
 
+#' Compare generated digestion fragments to an expected sequence list
+#'
+#' @param sequence Protein sequence under test.
+#' @param enzyme Supported digestion configuration.
+#' @param expected_peptides Character vector of expected fragments in order.
+#' @return One-row data frame with expected/observed sequences and a logical
+#'   `concordance` field.
+#' @details Uses default zero missed cleavages. Compares exact output order
+#'   as well as content; intended as a development/validation helper.
 compare_digestion <- function(sequence, enzyme, expected_peptides) {
   if (!enzyme %in% ENZYMES) {
     stop("Unknown enzyme: ", enzyme, call. = FALSE)
@@ -1782,6 +2150,8 @@ compare_digestion <- function(sequence, enzyme, expected_peptides) {
   )
 }
 
+# Shiny presentation layer: the scientific checks and score are implemented
+# above and shared by UI and noninteractive validation entry points.
 ui <- fluidPage(
   tags$head(
     tags$title("SeekNSee"),
@@ -2301,6 +2671,17 @@ ui <- fluidPage(
 
 active_sessions <- 0L
 
+#' Coordinate Shiny sessions, reactive state, and analysis execution
+#'
+#' @param input Shiny input object.
+#' @param output Shiny output object.
+#' @param session Current Shiny session.
+#' @return Shiny server-side reactive behavior (called for side effects).
+#' @details Loads FASTA data, maintains a per-session reference-match cache,
+#'   invokes the shared scientific functions, renders retained peptide views,
+#'   and builds XLSX exports. The application currently calls `stopApp()`
+#'   when its active-session count returns to zero; this lifecycle behavior
+#'   assumes a local application and should be reconsidered for shared hosting.
 server <- function(input, output, session) {
   active_sessions <<- active_sessions + 1L
   session$onSessionEnded(function() {
@@ -2520,6 +2901,12 @@ server <- function(input, output, session) {
       }
     }
   })
+#' Recompute candidates from the current Shiny state
+#'
+#' @return Updates reactive results and analysis context; invoked for side effects.
+#' @details Translates selected targets, enzyme, missed-cleavage setting,
+#'   and user rule choices to `make_target_candidates()`. Reuses the current
+#'   reference-match cache and does not itself export the workbook.
 recompute <- function() {
     req(reference_proteome())
     targets <- selected_targets()
